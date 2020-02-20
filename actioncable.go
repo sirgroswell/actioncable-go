@@ -1,16 +1,45 @@
 package actioncable
 
+//MIT License
+//
+//Copyright (c) 2016 Blake Gentry
+//
+//Permission is hereby granted, free of charge, to any person obtaining a copy
+//of this software and associated documentation files (the "Software"), to deal
+//in the Software without restriction, including without limitation the rights
+//to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//copies of the Software, and to permit persons to whom the Software is
+//furnished to do so, subject to the following conditions:
+//
+//The above copyright notice and this permission notice shall be included in all
+//copies or substantial portions of the Software.
+//
+//THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//SOFTWARE.
+
+// Original source write by Blake Gentry San Francisco
+//[![GoDoc](https://godoc.org/github.com/bgentry/actioncable-go?status.svg)][godoc]
+//
+//A golang client library for Rails' ActionCable. I wrote this solely because I
+//needed it and it's far from being a polished library.
+//
+//[godoc]: https://godoc.org/github.com/bgentry/actioncable-go
+
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
-	"net/http"
-	"sync"
-	"time"
-
 	"github.com/gorilla/websocket"
 	"github.com/jpillora/backoff"
+	"net/http"
+	log "pickdata/cirPark/cirGateway/pkg/pickdata/plog"
+	"sync"
+	"time"
 )
 
 // HeaderFunc is a function that returns HTTP headers or an error.
@@ -28,12 +57,15 @@ type Client struct {
 
 	// TODO: what actually needs a mutex??
 	mu            sync.Mutex
+	muRJSON        sync.Mutex
+	muWJSON        sync.Mutex
 	connHdrFunc   HeaderFunc
 	subscriptions map[string]chan *EventOrErr
 	closed        bool
 	donec         chan struct{}
 	waitc         chan struct{}
 	ref           int
+	Connected     bool
 }
 
 // NewClient creates a new Client that connects to the provided url using the
@@ -168,16 +200,17 @@ func (c *Client) connLoop() {
 	for {
 		err := c.connOnce(c.u, b.Reset)
 		if err != nil {
-			log.Printf("conn error: %s", err)
+			log.Error(2, "conn error: %s", err)
 		}
-		log.Println("disconnected")
+		log.Warn("disconnected")
+		c.Connected = false
 		select {
 		case <-c.donec:
 			close(c.waitc)
 			return
 			// TODO: backoff
 		case <-time.After(b.Duration()):
-			log.Println("reconnecting")
+			log.Warn("reconnecting")
 		}
 	}
 }
@@ -203,7 +236,7 @@ func (c *Client) connOnce(url string, f func()) error {
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	c.inactivityTimeoutTimer = time.NewTimer(c.inactivityTimeout)
 	defer c.inactivityTimeoutTimer.Stop()
@@ -223,15 +256,17 @@ func (c *Client) connOnce(url string, f func()) error {
 	// drain the old subscription requests and resubscribe
 	c.drainSubc()
 	c.resubscribe()
-
+	c.Connected = true
 	for {
 		go c.receiveMsg(conn, recvc)
 
 		select {
 		case <-c.donec:
+			log.Warn("Donec")
 			return nil
 		case eventOrErr := <-recvc:
 			if eventOrErr.Err != nil {
+				log.Error(2, "Event or Error force disconnection => %s", eventOrErr.Err)
 				return err
 			}
 			c.handleEvent(eventOrErr.Event)
@@ -242,6 +277,8 @@ func (c *Client) connOnce(url string, f func()) error {
 					Channel: chanName,
 				},
 			}
+			c.muWJSON.Lock()
+			defer c.muWJSON.Unlock()
 			if err := conn.WriteJSON(cmd); err != nil {
 				return err
 			}
@@ -290,13 +327,13 @@ func (c *Client) handleEvent(evt *Event) {
 	default:
 		ch := c.getSub(evt.Identifier.Channel)
 		if ch == nil {
-			log.Printf("received msg for unsubscribed channel: %s", evt.Identifier.Channel)
+			log.Info("received msg for unsubscribed channel: %s", evt.Identifier.Channel)
 			return
 		}
 		select {
 		case ch <- &EventOrErr{Event: evt}:
 		default:
-			log.Printf("no receiver ready, dropping message: %#v\n", evt)
+			log.Error(2, "no receiver ready, dropping message: %#v\n", evt)
 		}
 	}
 }
@@ -321,6 +358,8 @@ func (c *Client) getSub(name string) chan *EventOrErr {
 
 func (c *Client) receiveMsg(conn *websocket.Conn, recvc chan<- EventOrErr) {
 	event := &Event{}
+	c.muRJSON.Lock()
+	defer c.muRJSON.Unlock()
 	if err := conn.ReadJSON(event); err != nil {
 		recvc <- EventOrErr{Err: err}
 		return
